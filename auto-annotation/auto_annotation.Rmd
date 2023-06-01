@@ -1,0 +1,554 @@
+---
+title: "Auto-annotation"
+author: "mbrauer"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "../output") })
+output:
+  BiocStyle::pdf_document:
+    highlight: pygments
+    number_sections: yes
+    theme: united
+    toc: yes
+---
+
+# Auto-Annotate
+
+Running this script will annotate a set of genes and variants from the Maze catalog.
+Each section will generate a set of artifacts and publish these to CKAN.
+
+
+Annotations will comprise:
+
+1. **Gene** Tissue-specific expression (RNA and protein). Sources: GTEx and HPA.
+2. **Gene** Cell-type-specific expression for a tissue of interest. Sources: KPMP, Broad Single Cell Portal, HPA.
+3. **Variant** PheWAS readouts, general. Sources: UKB, Finngen, G&H, OpenTargets.
+4. **Variant** PheWAS readouts, tissue-focused. Sources: UKB, Finngen, G&H, OpenTargets.
+5. **Variant** MAF in various populations. Sources: UKB, Finngen, G&H, OpenTargets.
+6. **Gene and Variant** Mendelian phenotypes. Sources: OMIM, ClinGen, ClinVar, OpenTargets.
+7. **Gene** Mouse phenotype variants. Sources: Monarch, KOMP, OpenTargets
+8. **Gene** Molecular function of gene. Sources: Uniprot, OpenTargets
+9. **Variant** eQTL effect on RNA levels in specific tissues. Sources: Szustak lab kidney atlas, Neptune
+10. **Gene** Pathway.
+11. **Gene** Tool compounds.
+
+Each of the output will generate one or more resources in the "Gene Summaries"
+or "Variant Summaries" package within the Sightline CKAN organization.
+
+
+```{r setup, echo=FALSE, include=TRUE, eval=FALSE, message=FALSE}
+knitr::opts_chunk$set(eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE,
+                      fig.width=12, fig.height=8)
+
+library(tidyverse)
+library(ckanr)
+library(jsonlite)
+library(TissueEnrich)
+library(kable)
+library(kableExtra)
+library(flextable)
+
+data_dir <- "/data/AutoAnnotation"
+
+tempdir <- tempdir()
+
+# Set S3 staging directory and AWS profile: requires a profile of `profile_name` in `~/.aws/config` file
+
+s3_staging_dir <- 's3://aws-athena-query-results-169945233738-us-west-2/'
+user_profile <- 'superuser'
+
+# suppress breaking error
+options(rstudio.connectionObserver.errorsSuppressed = TRUE)
+
+
+# Set CKAN session
+ckan_url <- Sys.getenv("CKAN_URL")
+ckan_key <- Sys.getenv("CKAN_KEY")
+ckanr::ckanr_setup(url = ckan_url, key = ckan_key)
+
+sightline_org_id <- "acd65bfd-df6d-4297-ae33-ab837864b022"
+sightline_catalog_pkg_id <- "6035361d-871c-4e24-a027-e044fe5d42a7"
+
+filter_context <- "Renal New Targets 2023"
+filter_tissue <- "kidney"
+
+```
+
+
+
+```{sh get-credentials, eval=FALSE, echo=FALSE}
+aws sso login
+```
+
+
+## Get genes and variants from CKAN catalog
+
+Loading targets and variants from the CKAN datastore. This results in simple
+lists of identifiers, with minimal annotation. In the case of genes, the gene
+symbol and the gene's "context" (i.e., which program it is relevant to) are
+shown. For variants the associated gene_id and symbol are given.
+
+
+```{r get-genes-from-ckan, eval=FALSE}
+
+# Sightline organization
+sightline_org_id <- "acd65bfd-df6d-4297-ae33-ab837864b022"
+sightline_catalog_pkg_id <- "6035361d-871c-4e24-a027-e044fe5d42a7"
+sightline_genes_catalog_res_id <- "7f7d302e-f5ab-49e2-812d-8d77473e9ab0"
+
+genes <- ckanr::ds_search(resource_id = sightline_genes_catalog_res_id,
+                 as="table")$records %>%
+  tibble::as_tibble() %>%
+  dplyr::select(-`_id`)
+
+# save to cache
+genes %>%
+  saveRDS(fs::path(data_dir, "genes.rds"))
+
+```
+
+
+```{r get-genes-from-local-cache}
+
+genes <- readRDS(fs::path(data_dir, "genes.rds"))
+
+genelist <- genes %>%
+  filter(context == filter_context) %>%
+  distinct(gene_id) %>%
+  pull(gene_id) 
+
+gene_string <- paste0('(',
+                      genes %>%
+                        filter(context == filter_context) %>%
+                        distinct(gene_id) %>%
+                        pull(gene_id) %>%
+                        str_c("'", ., "'") %>%
+                        str_flatten_comma(),
+                      ')')
+
+```
+
+```{r get-variants-from-ckan}
+# Sightline organization
+sightline_org_id <- "acd65bfd-df6d-4297-ae33-ab837864b022"
+sightline_catalog_pkg_id <- "6035361d-871c-4e24-a027-e044fe5d42a7"
+sightline_variant_catalog_res_id <- ""
+
+variants <- ckanr::ds_search(resource_id = sightline_variant_catalog_res_id,
+                 as="table")$records %>%
+  tibble::as_tibble() %>%
+  dplyr::select(-`_id`) %>%
+  saveRDS(fs::path(data_dir, "variants.rds"))
+
+head(variants)
+```
+
+## 1. Tissue-specific expression (RNA and protein). Sources: GTEx and HPA.
+
+Output 1:
+  * GTEx: Box plot of normalized expression (RPKM) across tissues for single gene [could this be a table?]
+  * HPA: table of protein expression score across all tissues
+Output 2:
+  * GTEx: Heatmap of normalized expression (RPKM) of all genes from genetics scan across all tissues (expression shown as relative to median across tissues for each gene)
+  * HPA: heatmap of protein expression score of all genes from genetics scan across all tissues (HPA)
+```{r load-expression-resources-from-ckan, eval=FALSE}
+
+# this will eventually load data from Athena rather than CKAN
+table_ids <- c(gtex = "44b1fed5-7367-4a70-b64f-8a1b3431ff23",
+              hpa = "c9f98923-0924-49b8-a6d7-932a72a867df",
+              consensus = "a73b0a08-ce3a-4e8a-b400-99818d83cd8b",
+              normal = "b7a1fe13-3a84-4fd6-97bb-6daf1ea0f27d")
+
+where_clause <- paste('where gene_id in', gene_string)
+
+expression_resources <- setNames(
+  lapply(table_ids, function(table_id) {
+  ckanr::ds_search_sql(sql = paste('select * from',
+                                   paste0('\"', table_id, '\"'),
+                                   where_clause),
+                       as="table")$records %>%
+    tibble::as_tibble() %>%
+    dplyr::select(-`_id`, -`_full_text`)
+  }),
+  names(table_ids))
+
+```
+
+```{r load-expression-resources-from-athena, eval=FALSE}
+
+```
+
+```{r load-expression-resources-from-local-cache}
+
+# this is for development only--these resources to come from the data lake
+
+gtex <- readr::read_tsv("../data/hpa/rna_tissue_gtex.tsv") %>%
+  dplyr::rename(gene_id = Gene, symbol = `Gene name`)
+hpa <- readr::read_tsv("../data/hpa/rna_tissue_hpa.tsv") %>%
+  dplyr::rename(gene_id = Gene, symbol = `Gene name`)
+consensus <- readr::read_tsv("../data/hpa/rna_tissue_gtex.tsv") %>%
+  dplyr::rename(gene_id = Gene, symbol = `Gene name`)
+
+normal <- readr::read_tsv("../data/hpa/normal_tissue.tsv") %>%
+  dplyr::rename(gene_id = Gene, symbol = `Gene name`, cell_type = `Cell type`) %>%
+  dplyr::mutate(level = if_else(Level %in% c("Medium","Low","High"), Level, "ND"),
+                level = ordered(level, levels = c("ND", "Low", "Medium", "High")),
+                value = as.integer(level) - 1) %>%
+  tidyr::unite(tissue_cell, Tissue:cell_type, remove = FALSE)
+
+gtex_v8_rpkms <- readr::read_tsv("../data/GTEx/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_reads.gct", skip = 2)
+gtex_v8_rpkms <- gtex_v8_rpkms %>%
+  dplyr::rename(symbol = Description) %>%
+  tidyr::separate_wider_delim(Name, ".", names = c("gene_id", "gene_id_version")) %>%
+  dplyr::select(gene_id, gene_id_version, symbol, everything()) %>%
+  readr::write_csv(fs::path(tempdir, "gtex_v8_rpkms.csv"))
+
+gtex_v8_tpm <- readr::read_tsv("../data/GTEx/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_tpm.gct", skip = 2)
+gtex_v8_tpm <- gtex_v8_tpm %>%
+  dplyr::rename(symbol = Description) %>%
+  tidyr::separate_wider_delim(Name, ".", names = c("gene_id", "gene_id_version")) %>%
+  dplyr::select(gene_id, gene_id_version, symbol, everything()) %>%
+  readr::write_csv(fs::path(tempdir, "gtex_v8_tpm.csv"))
+
+gtex_v8_median <- readr::read_tsv("../data/GTEx/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_median_tpm.gct", skip = 2) 
+gtex_v8_median <- gtex_v8_median %>%
+  dplyr::rename(symbol = Description) %>%
+  tidyr::separate_wider_delim(Name, ".", names = c("gene_id", "gene_id_version")) %>%
+  dplyr::select(gene_id, gene_id_version, symbol, everything()) %>%
+  readr::write_csv(fs::path(tempdir, "gtex_v8_median.csv"))
+
+gtex_v8_samples <- readr::read_tsv("../data/GTEx/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt") %>%
+  readr::write_csv(fs::path(tempdir, "gtex_v8_samples.csv"))
+
+gtex_v8_phenotypes <- readr::read_tsv("../data/GTEx/GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt") %>%
+  readr::write_csv(fs::path(tempdir, "gtex_v8_phenotypes.csv"))
+
+expression_resources <- list(gtex = gtex,
+                             hpa = hpa,
+                             consensus = consensus,
+                             normal = normal,
+                             gtex_rpkms = gtex_v8_rpkms,
+                             gtex_tpm = gtex_v8_tpm,
+                             gtex_median = gtex_v8_median,
+                             gtex_samples = gtex_samples,
+                             gtex_phenotypes = gtex_phenotypes)
+
+```
+
+### Output 1: GTEx box plot of normalized expression (RPKM) across tissues for each gene
+
+Code generates plots and saves to CKAN in Sightline organization, "Gene Summaries"
+package. Each plot is a resource.
+
+```{r gtex-box-plots}
+sightline_summary_pkg_id <- "" # package "gene summaries" in Sightline organization
+
+symbollist <- genes %>%
+  filter(context == filter_context) %>%
+  distinct(symbol) %>%
+  pull(symbol) 
+
+rpkms <- gtex_v8_rpkms %>%
+  dplyr::filter(gene_id %in% (genes %>%
+                  filter(context == filter_context) %>%
+                  distinct(gene_id) %>%
+                  pull(gene_id))) %>%
+  pivot_longer(cols = c(-gene_id, -gene_id_version, -symbol), names_to = "SAMPID", values_to = "expression") %>%
+  left_join(gtex_v8_samples %>% dplyr::select(SAMPID, SMTS, SMTSD), by="SAMPID") %>%
+  dplyr::rename(Tissue = SMTS, Subtissue = SMTSD)
+
+lapply(symbollist, function(gene) {
+  tempfile = fs::path(tempdir, paste0(gene, ".png"))
+  p <- rpkms %>%
+    dplyr::filter(symbol == gene) %>%
+    ggplot(aes(x=Tissue, y=expression, group=Tissue)) +
+    geom_boxplot() +
+    ggtitle(gene) +
+    ylab("GTEx RPKMs") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  png(tempfile)
+  print(p)
+  dev.off()
+  ckanr::resource_create(package_id = sightline_summary_pkg_id,
+                         name = paste0(gene, "_GTEx_tissue_expn_boxplot"),
+                         description = paste0("GTEx tissue expression for", gene),
+                         upload = fs::path(tempfile, "gtex_v8_phenotypes.csv"),
+                         url = ckan_url,
+                         key = ckan_key)
+  unlink(tempfile)
+})
+```
+
+### Output 1: plot and table of HPA protein expression score across all tissues
+
+Generates and publishes a table of tissue-specific protein expression.
+
+```{r tissue-protein-expression}
+
+p <- genes %>%
+  dplyr::filter(context == filter_context) %>%
+  left_join(normal) %>%
+  dplyr::select(symbol, Tissue, cell_type, value) %>%
+  readr::write_csv(fs::path(tempdir, "tissue_protein_expression.csv")) %>%
+  ggplot(aes(symbol, Tissue)) + geom_tile(aes(fill = value),
+                                              colour = "white") + scale_fill_gradient(low = "white",
+                                                                                      high = "steelblue")+
+  labs(x='', y = '') +
+  theme_bw() +
+  ggtitle(paste("Tissue protein detection for genes from", filter_context)) +
+  guides(fill = guide_legend(title = "Protein level")) +
+  #theme(legend.position="none") +
+  theme(plot.title = element_text(hjust = 0.5,size = 20),axis.title = element_text(size=15))+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),panel.grid.major= element_blank(),panel.grid.minor = element_blank())
+
+```
+
+```{r tissue-gene-expression}
+
+genes %>%
+  dplyr::filter(context == filter_context) %>%
+  left_join(consensus) %>%
+  dplyr::select(symbol, Tissue, nTPM, TPM) %>%
+  dplyr::mutate(logTPM = log(TPM + 0.0001)) %>%
+  readr::write_csv(fs::path(tempdir, "tissue_gene_expression.csv")) %>%
+  ggplot(aes(symbol, Tissue)) + geom_tile(aes(fill = logTPM),
+                                              colour = "white") + scale_fill_gradient(low = "white",
+                                                                                      high = "steelblue")+
+  labs(x='', y = '') +
+  theme_bw() +
+  ggtitle(paste("Tissue expression of genes from", filter_context)) +
+  guides(fill = guide_legend(title = "Log(nTPM)")) +
+  #theme(legend.position="none") +
+  theme(plot.title = element_text(hjust = 0.5,size = 20),axis.title = element_text(size=15))+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),panel.grid.major= element_blank(),panel.grid.minor = element_blank())
+
+```
+
+### Within specific tissue
+
+```{r tissue-specific-gene-expression, eval=FALSE}
+
+# data to come from KPMP and other sources
+
+genes %>%
+  dplyr::filter(context == filter_context) %>%
+  left_join(consensus) %>%
+  dplyr::filter(Tissue == filter_tissue) %>%
+  dplyr::select(symbol, Tissue, nTPM, TPM) %>%
+  dplyr::mutate(logTPM = log(TPM + 0.0001)) %>%
+  readr::write_csv(fs::path(tempdir, "tissue_gene_expression.csv")) %>%
+  ggplot(aes(symbol, Tissue)) + geom_tile(aes(fill = logTPM),
+                                              colour = "white") + scale_fill_gradient(low = "white",
+                                                                                      high = "steelblue")+
+  labs(x='', y = '') +
+  theme_bw() +
+  ggtitle(paste("Tissue expression of genes from", filter_context)) +
+  guides(fill = guide_legend(title = "Log(nTPM)")) +
+  #theme(legend.position="none") +
+  theme(plot.title = element_text(hjust = 0.5,size = 20),axis.title = element_text(size=15))+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),panel.grid.major= element_blank(),panel.grid.minor = element_blank())
+
+```
+
+
+```{r tissue-specific-protein-expression}
+
+p <- genes %>%
+  dplyr::filter(context == filter_context) %>%
+  left_join(normal) %>%
+  dplyr::filter(Tissue == filter_tissue) %>%
+  dplyr::select(symbol, Tissue, cell_type, value) %>%
+  readr::write_csv(fs::path(tempdir, "tissue_specific_protein_hpa.csv")) %>%
+  ggplot(aes(symbol, cell_type)) + geom_tile(aes(fill = value),
+                                              colour = "white") + scale_fill_gradient(low = "white",
+                                                                                      high = "steelblue")+
+  labs(x = '', y = '') +
+  theme_bw() +
+  guides(fill = guide_legend(title = "Protein Level")) +
+  ggtitle(paste("Protein detection in", filter_tissue, "for genes from", filter_context)) +
+  #theme(legend.position="none") +
+  theme(plot.title = element_text(hjust = 0.5,size = 20),axis.title = element_text(size=15)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+  panel.grid.major= element_blank(),panel.grid.minor = element_blank())
+
+
+```
+
+## 7. Mouse models and phenotypes
+
+```{r mouse-models-and-phenotypes-from}
+knitr::opts_chunk$set(eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE,
+                      fig.width=12, fig.height=8)
+
+con <- noctua::dbConnect(noctua::athena(),
+                         profile_name = user_profile,
+                         s3_staging_dir = s3_staging_dir)
+
+
+query_string <- paste("select * from open_targets.mouse_phenotypes where targetfromsourceid in", gene_string)
+
+system.time({res <- noctua::dbExecute(con, query_string)})
+
+output <- noctua::dbFetch(res) %>%
+tibble::as_tibble()
+
+noctua::dbClearResult(res)
+
+
+# Function to read a JSON file where each line is a JSON string
+read_json_lines <- function(filepath) {
+  lines <- read_lines(filepath)
+  df_list <- map(lines, ~fromJSON(.x, simplifyDataFrame = TRUE))
+  lapply(df_list, function(df) {
+    df %>%
+      map_if(is.data.frame, list) %>%
+      as_tibble()
+  }) %>% bind_rows()
+}
+
+filepath <- "../data/opentargets/mouse_phenotypes.json"
+
+mouse_models <- read_json_lines(filepath)
+
+# for import into sql table:
+# mouse_models <- mouse_models %>% mutate(index = row_number())
+# biologicalModels <- mouse_models %>% dplyr::select(index, biological_models) %>% unnest(biologicalModels) 
+# modelPhenotypeClasses <- mouse_models %>% unnest(modelPhenotypeClasses)
+# modelDetails <- mouse_models %>% select(-biologicalModels, -modelPhenotypeClasses)
+
+mouse_models %>% saveRDS("../data/opentargets/mouse_models.rds")
+
+relevant_models <- mouse_models %>%
+  dplyr::filter(targetFromSourceId %in% genelist)
+
+relevant_models %>% saveRDS("../data/opentargets/relevant_models.rds")
+
+
+model_count <- genes %>%
+  dplyr::filter(context == filter_context) %>%
+  left_join(relevant_models %>% summarize(number_of_models=n(),
+                                          .by = targetFromSourceId),
+            by=c("gene_id"="targetFromSourceId")) %>%
+  tidyr::replace_na(list("number_of_models" = 0))
+
+model_summary <- setNames(relevant_models %>%
+                            group_by(targetFromSourceId) %>%
+                            group_split(),
+                          relevant_models %>%
+                            group_by(targetFromSourceId) %>%
+                            group_keys() %>%
+                            left_join(genes %>%
+                                        dplyr::filter(context == filter_context),
+                                      by=c("targetFromSourceId"="gene_id")) %>%
+                            pull(symbol))
+
+
+model_catalog <- lapply(model_summary, function(target) {
+  target %>%
+    left_join(genes %>%
+                dplyr::filter(context == filter_context),
+              by=c("targetFromSourceId"="gene_id")) %>%
+    dplyr::select(-context, -modelPhenotypeClasses) %>%
+    unnest(biologicalModels)
+})
+
+
+gene_list_2 <- c("ENSG00000100342",)
+```
+
+```{r}
+model_catalog[[1]] %>%
+  dplyr::select(symbol, targetFromSourceId, targetInModel, targetInModelMgiId,
+                targetInModelEnsemblId, modelPhenotypeId, modelPhenotypeLabel,
+                id, allelicComposition, geneticBackground) %>%
+  flextable::regulartable() %>%
+  flextable::theme_box() %>%
+  flextable::merge_v(c("symbol", "targetFromSourceId", "targetInModel",
+                       "targetInModelMgiId", "targetInModelEnsemblId",
+                       "modelPhenotypeId", "modelPhenotypeLabel")) %>%
+  flextable::valign(valign = "top", part = "all") %>%
+  flextable::set_table_properties(width = 1, layout = "autofit") %>%
+  flextable::set_header_labels(targetFromSourceId = "ENSG",
+                               targetInModel = "mouse gene",
+                               targetInModelMgiId = "mouse gene MGI",
+                               targetInModelEnsemblId = "mouse gene ENS",
+                               modelPhenotypeId = "phenotype",
+                               id = "model ID",
+                               allelicComposition = "allelic composition",
+                               geneticBackground = "genetic background"
+                               )
+```
+
+
+
+```{r tissue-specificity, eval=FALSE}
+geneset <- targets %>%
+  dplyr::filter(context == "Renal New Targets 2023") %>%
+  distinct(symbol) %>%
+  pull(symbol)
+
+gs <- GeneSet(geneIds = geneset, organism="Homo Sapiens", geneIdType=SymbolIdentifier())
+output <- teEnrichment(inputGenes = gs)
+
+
+seEnrichmentOutput<-output[[1]]
+enrichmentOutput<-setNames(data.frame(assay(seEnrichmentOutput),row.names = rowData(seEnrichmentOutput)[,1]), colData(seEnrichmentOutput)[,1])
+enrichmentOutput$Tissue<-row.names(enrichmentOutput)
+enrichmentOutput %>%
+  tibble::as_tibble() %>%
+  dplyr::select(Tissue, Tissue.Specific.Genes, fold.change, Log10PValue) %>%
+  rename(tissue_specific_genes = Tissue.Specific.Genes,
+         fold_change = fold.change)
+
+seExp<-output[[2]][["Kidney"]]
+exp<-setNames(data.frame(assay(seExp), row.names = rowData(seExp)[,1]), colData(seExp)[,1])
+exp$Gene<-row.names(exp)
+exp<-exp %>% gather(key = "Tissue", value = "expression",1:(ncol(exp)-1))
+
+tissue_enrichment <- exp %>%
+  tibble::as_tibble() %>%
+  pivot_wider(names_from = Tissue, values_from = expression) %>%
+  arrange(Gene)
+
+ggplot(exp, aes(Tissue, Gene)) + geom_tile(aes(fill = expression),
+                                           colour = "white") + scale_fill_gradient(low = "white",
+                                                                                   high = "steelblue")+
+  labs(x='', y = '')+
+  theme_bw()+
+  guides(fill = guide_legend(title = "Log2(TPM)"))+
+  #theme(legend.position="none")+
+  theme(plot.title = element_text(hjust = 0.5,size = 20),axis.title = element_text(size=15))+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),panel.grid.major= element_blank(),panel.grid.minor = element_blank())
+
+
+```
+
+
+```{r query-athena}
+
+
+con <- noctua::dbConnect(noctua::athena(),
+                         profile_name = user_profile,
+                         s3_staging_dir = s3_staging_dir)
+
+
+query_string <- "select * from sightline.target_concepts"
+
+system.time({res <- noctua::dbExecute(con, query_string)})
+
+output <- noctua::dbFetch(res)
+noctua::dbClearResult(res)
+
+output %>% tibble::as_tibble()
+```
+
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

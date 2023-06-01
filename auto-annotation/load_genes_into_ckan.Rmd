@@ -1,0 +1,192 @@
+---
+title: "Load Sightline Genes"
+author: "mbrauer"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "../output") })
+output:
+  BiocStyle::pdf_document:
+    highlight: pygments
+    number_sections: yes
+    theme: united
+    toc: yes
+---
+
+```{sh get-credentials}
+aws sso login
+#aws --profile default secretsmanager get-secret-value --secret-id mazetx.credentials.sa.athena | jq -r .SecretString | jq
+```
+
+```{r setup, echo=FALSE, include=TRUE, eval=TRUE, message=FALSE}
+knitr::opts_chunk$set(eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE,
+                      fig.width=8, fig.height=4)
+
+library(biomaRt)
+library(tidyverse)
+library(ckanr)
+library(noctua)
+
+tempdir <- tempdir()
+
+# Set S3 staging directory and AWS profile: requires a profile of `profile_name` in `~/.aws/config` file
+
+s3_staging_dir <- 's3://aws-athena-query-results-169945233738-us-west-2/'
+user_profile <- 'superuser'
+
+# suppress breaking error
+options(rstudio.connectionObserver.errorsSuppressed = TRUE)
+
+
+# Set CKAN session
+ckan_url <- Sys.getenv("CKAN_URL")
+ckan_key <- Sys.getenv("CKAN_KEY")
+ckanr::ckanr_setup(url = ckan_url, key = ckan_key)
+
+con <- noctua::dbConnect(noctua::athena(),
+                         profile_name = user_profile,
+                         s3_staging_dir = s3_staging_dir)
+
+
+mart <- useMart('ENSEMBL_MART_ENSEMBL')
+mart <- useDataset('hsapiens_gene_ensembl', mart)
+
+```
+
+```{r get-genes-from-sightline}
+
+query_string <- "select * from sightline.target_concepts"
+
+system.time({res <- noctua::dbExecute(con, query_string)})
+
+output <- noctua::dbFetch(res)
+noctua::dbClearResult(res)
+
+allTargets <- output %>%
+  tibble::as_tibble() %>%
+  dplyr::select(gene, disease) %>%
+  rename(gene_id = gene, context = disease)
+
+symbol_map <- getBM(
+  mart = mart,
+  attributes = c('ensembl_gene_id','hgnc_symbol'),
+  filter = 'ensembl_gene_id',
+  values = allTargets$gene_id,
+  uniqueRows = TRUE) %>%
+  tibble::as_tibble() %>%
+  rename(gene_id = ensembl_gene_id, symbol = hgnc_symbol)
+
+allTargets <- allTargets %>%
+  left_join(symbol_map) %>%
+  dplyr::select(gene_id, symbol, context)
+
+renalNewTargets <- toupper(c('Aak1', 'Apoc3', 'Arg1', 'Blvrb', 'Cgnl1', 'Ckm',
+                             'Cldn10', 'Col4a', 'Cubn', 'Dab2', 'Fnip1', 'G6pc',
+                             'Gatm', 'Ift140', 'Lcn8', 'Lrp2', 'Miox', 'Mitf',
+                             'Mtm1', 'Ninl', 'Nphp3', 'Nphs1', 'Pkd1', 'Pkd2',
+                             'Pkhd1', 'Rnf128', 'Rpl3l', 'Slc22a1', 'Slc22a2',
+                             'Slc25a45', 'Slc34a1', 'Slc34a3', 'Slc47a1',
+                             'Slc6a19', 'Slc7a9', 'Svil', 'Umod', 'Smad6'))
+
+newTargets <- getBM(
+  mart = mart,
+  attributes = c('ensembl_gene_id','hgnc_symbol'),
+  filter = 'hgnc_symbol',
+  values = renalNewTargets,
+  uniqueRows = TRUE) %>%
+  tibble::as_tibble() %>%
+  rename(gene_id = ensembl_gene_id,
+         symbol = hgnc_symbol) %>%
+  dplyr::select(gene_id, symbol) %>%
+  mutate(context = "Renal New Targets 2023")
+
+targets <- allTargets %>%
+  bind_rows(newTargets) %>%
+  readr::write_csv("data/resources/sightline_targets.csv")
+
+
+```
+
+
+```{r load-genes-into-ckan}
+sightline_org_id <- "acd65bfd-df6d-4297-ae33-ab837864b022"
+sightline_catalog_pkg_id <- "6035361d-871c-4e24-a027-e044fe5d42a7"
+
+ckanr::resource_create(package_id = sightline_catalog_pkg_id,
+                       name = "genes",
+                       description = "genes in the Sightline catalog",
+                       upload = "data/resources/sightline_targets.csv",
+                       url = ckan_url,
+                       key = ckan_key)
+
+sightline_genes_catalog_res_id <- "7f7d302e-f5ab-49e2-812d-8d77473e9ab0"
+
+```
+
+```{r load-resources-into-ckan}
+external_data_org_id <- "8ac4fd03-3b65-447b-a1ba-2ff363c8489d"
+hpa_data_pkg_id <- "955298de-4440-4bd3-a2c0-5d752c822791"
+
+# pkg <- ckanr::package_create(name="human_protein_atlas",
+#                              title="Human Protein Atlas",
+#                              notes="Downloaded resources from HPA: https://www.proteinatlas.org/about/download",
+#                              author="Matt Brauer",
+#                              author_email="mbrauer@mazetx.com",
+#                              maintainer="Matt Brauer",
+#                              maintainer_email="mbrauer@mazetx.com",
+#                              owner_org=external_data_org_id,
+#                              url=ckan_url,
+#                              key=ckan_key
+# )
+# hpa_data_pkg_id <- pkg$id
+
+
+gtex <- readr::read_tsv("data/hpa/rna_tissue_gtex.tsv") %>%
+  rename(gene_id = Gene, symbol = `Gene name`) %>%
+  readr::write_csv(fs::path(tempdir, "rna_tissue_gtex.csv"))
+hpa <- readr::read_tsv("data/hpa/rna_tissue_hpa.tsv") %>%
+  rename(gene_id = Gene, symbol = `Gene name`) %>%
+  readr::write_csv(fs::path(tempdir, "rna_tissue_hpa.csv"))
+consensus <- readr::read_tsv("data/hpa/rna_tissue_consensus.tsv") %>%
+  rename(gene_id = Gene, symbol = `Gene name`) %>%
+  readr::write_csv(fs::path(tempdir, "rna_tissue_consensus.csv"))
+
+normal <- readr::read_tsv("data/hpa/normal_tissue.tsv") %>%
+  rename(gene_id = Gene, symbol = `Gene name`, cell_type = `Cell type`) %>%
+  mutate(level = if_else(Level %in% c("Medium","Low","High"), Level, "ND"),
+         level = ordered(level, levels = c("ND", "Low", "Medium", "High")),
+         value = as.integer(level) - 1) %>%
+  unite(tissue_cell, Tissue:cell_type, remove = FALSE) %>%
+  readr::write_csv(fs::path(tempdir, "protein_normal_tissue.csv"))
+
+# ckanr::resource_create(package_id = hpa_data_pkg_id,
+#                        name = "rna_tissue_gtex",
+#                        description = "RNA tissue expression from GTEx",
+#                        upload = fs::path(tempdir, "rna_tissue_gtex.csv"),
+#                        url = ckan_url,
+#                        key = ckan_key)
+rna_tissue_gtex_id <- "44b1fed5-7367-4a70-b64f-8a1b3431ff23"
+# ckanr::resource_create(package_id = hpa_data_pkg_id,
+#                        name = "rna_tissue_hpa",
+#                        description = "RNA tissue expression from HPA",
+#                        upload = fs::path(tempdir, "rna_tissue_hpa.csv"),
+#                        url = ckan_url,
+#                        key = ckan_key)
+rna_tissue_hpa_id <- "c9f98923-0924-49b8-a6d7-932a72a867df"
+# ckanr::resource_create(package_id = hpa_data_pkg_id,
+#                        name = "rna_tissue_consensus",
+#                        description = "RNA tissue expression consensus between GTEx and HPA",
+#                        upload = fs::path(tempdir, "rna_tissue_consensus.csv"),
+#                        url = ckan_url,
+#                        key = ckan_key)
+rna_tissue_consensus_id <- "a73b0a08-ce3a-4e8a-b400-99818d83cd8b"
+# ckanr::resource_create(package_id = hpa_data_pkg_id,
+#                        name = "protein_normal_tissue",
+#                        description = "Protein levels in normal tissue",
+#                        upload = fs::path(tempdir, "protein_normal_tissue.csv"),
+#                        url = ckan_url,
+#                        key = ckan_key)
+protein_normal_tissue_id <- "b7a1fe13-3a84-4fd6-97bb-6daf1ea0f27d"
+
+
+```
+
