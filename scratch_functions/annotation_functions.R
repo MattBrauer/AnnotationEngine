@@ -1,3 +1,29 @@
+#' Annotate set of genes
+#'
+#' @description
+#'
+#' @param genes A vector of Ensembl gene_ids
+#' @param data_dir The location where output will be placed
+#'
+#' @return A list containing the annotation artifacts created, as files, in
+#'  `data_dir`
+
+#' @export
+annotate_genes <- function(geneset, data_dir, session = session) {
+    check_geneset()
+    check_data_dir()
+    
+        output <- setNames(lapply(as.list(c(geneset, "geneset")), function(gene) {
+        list("tables" = list(), "figures" = list())
+        }),
+             c(geneset, "geneset"))
+    
+}
+
+
+
+
+
 #' Generate HTML table of mouse phenotypes by gene
 #'
 #' @description
@@ -7,7 +33,7 @@
 #' @return A formatted HTML table of phenotypes for the mouse ortholog
 #' @export
 mouse_phenotypes <- function(gene) {
-  readRDS(fs::path(data_dir, "opentargets/mouse_models.rds")) %>%
+  readRDS(fs::path(data_dir, "opentargets/mouse_models.rds")) %>% # need to regenerate after data update
     dplyr::filter(targetFromSourceId == gene) %>%
     unnest(modelPhenotypeClasses) %>%
     dplyr::rename(pheID = id, pheLabel = label) %>%

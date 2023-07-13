@@ -190,3 +190,25 @@ protein_normal_tissue_id <- "b7a1fe13-3a84-4fd6-97bb-6daf1ea0f27d"
 
 ```
 
+```{r}
+kpmp_DGEList <- readRDS(fs::path(data_dir, "kpmp/pbulk-DGEList-cells.rds"))
+kpmp_pseudobulk <- cpm(kpmp_DGEList, log = TRUE, prior.count = 5)[names(gene_annotation$genes),] %>%
+    tibble::as_tibble(rownames = "gene_id") %>%
+    tidyr::pivot_longer(-gene_id,
+                        names_to = "sample",
+                        values_to = "cpm") %>%
+    dplyr::left_join(kpmp_DGEList$samples %>% tibble::as_tibble(rownames = "sample"),
+                     by = "sample") %>%
+    dplyr::select(gene_id,
+                  sample,
+                  cpm,
+                  cell_abbrev,
+                  cell_label,
+                  condition.l2,
+                  structure) %>%
+    dplyr::left_join(gene_annotation$ensembl %>% distinct(),
+                         by = "gene_id") %>%
+    dplyr::select(gene_id, symbol, sample, everything())
+
+
+```

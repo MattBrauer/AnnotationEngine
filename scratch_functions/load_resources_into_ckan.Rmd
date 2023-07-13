@@ -1,0 +1,525 @@
+---
+title: "Load Sightline Gene and Variant Catalogs"
+author: "mbrauer"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "../output") })
+output:
+  BiocStyle::pdf_document:
+    highlight: pygments
+    number_sections: yes
+    theme: united
+    toc: yes
+---
+
+```{sh get-credentials}
+aws sso login
+```
+
+```{r setup, echo=FALSE, include=TRUE, eval=TRUE, message=FALSE}
+knitr::opts_chunk$set(eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE,
+                      fig.width=12, fig.height=8)
+
+library(tidyverse)
+library(ckanr)
+library(jsonlite)
+library(TissueEnrich)
+library(kableExtra)
+library(flextable)
+library(edgeR)
+library(biomaRt)
+
+data_dir <- "/data/AutoAnnotate"
+
+tempdir <- tempdir()
+
+# Set S3 staging directory and AWS profile: requires a profile of `profile_name` in `~/.aws/config` file
+
+s3_staging_dir <- 's3://aws-athena-query-results-169945233738-us-west-2/'
+user_profile <- 'superuser'
+
+# suppress breaking error
+options(rstudio.connectionObserver.errorsSuppressed = TRUE)
+
+# Set CKAN session
+ckan_url <- Sys.getenv("CKAN_URL")
+ckan_key <- Sys.getenv("CKAN_KEY")
+ckanr::ckanr_setup(url = ckan_url, key = ckan_key)
+
+mart <- biomaRt::useDataset('hsapiens_gene_ensembl', biomaRt::useMart('ENSEMBL_MART_ENSEMBL'))
+
+con <- noctua::dbConnect(noctua::athena(),
+                         profile_name = user_profile,
+                         s3_staging_dir = s3_staging_dir)
+
+```
+
+```{r get-genes-and-variants-from-athena-and-ckan, eval=FALSE}
+
+# Get genes from current Sightline database
+# This block should be run once, after which time it will be necessary only to
+# retrieve genes from the production Sightline instance
+query_string <- "select * from sightline.target_concepts"
+
+system.time({res <- noctua::dbExecute(con, query_string)})
+
+output <- noctua::dbFetch(res)
+noctua::dbClearResult(res)
+
+oldTargets <- output %>%
+    tibble::as_tibble() %>%
+    dplyr::select(gene, disease) %>%
+    dplyr::rename(gene_id = gene,
+                  notes = disease) %>%
+    dplyr::mutate(context = "existing program")
+
+symbol_map <- getBM(
+  mart = mart,
+  attributes = c('ensembl_gene_id','hgnc_symbol'),
+  filter = 'ensembl_gene_id',
+  values = oldTargets$gene_id,
+  uniqueRows = TRUE) %>%
+  tibble::as_tibble() %>%
+  dplyr::rename(gene_id = ensembl_gene_id, symbol = hgnc_symbol)
+
+oldTargets <- oldTargets %>%
+  left_join(symbol_map) %>%
+  dplyr::select(gene_id, symbol, context, notes)
+
+
+# get genes from Renal New Targets sheet
+# this should eventually be replaced by loading new targets into Sightline
+renal_new_targets_list_res_id <- "0615055f-a44d-4684-a655-9572dd60413b"
+renal_new_targets <- ckanr::ds_search(resource_id = renal_new_targets_list_res_id,
+                 as="table")$records %>%
+    tibble::as_tibble() %>%
+    dplyr::select(-`_id`) %>%
+    dplyr::mutate(symbol = toupper(Gene),
+                  source = paste0("source:", `Identified in which analyses`),
+                  context = "Renal New Targets 2023") %>%
+    tidyr::separate_wider_delim(`Include in analysis`, delim = ';', names = c("include","reason"), too_few = "align_start") %>%
+    dplyr::mutate(context = paste0(context, ifelse(include == "No", "--exclude", ""))) %>%
+    dplyr::mutate(include = paste0("include:", include),
+                  reason = paste0("reason:", reason)) %>%
+    tidyr::unite(notes, c(include, reason, source), sep = ",") %>%
+    dplyr::select(symbol, context, notes) %>%
+    dplyr::mutate(symbol = ifelse(symbol == "G6PC", "G6PC1", symbol),  # fix errors
+                  symbol = ifelse(symbol == "COL4A", "COL4A3", symbol))
+
+newTargets <- getBM(
+    mart = mart,
+    attributes = c('ensembl_gene_id','hgnc_symbol'),
+    filter = 'hgnc_symbol',
+    values = renal_new_targets$symbol,
+    uniqueRows = TRUE) %>%
+    tibble::as_tibble() %>%
+    dplyr::rename(gene_id = ensembl_gene_id,
+                symbol = hgnc_symbol) %>%
+    dplyr::select(gene_id, symbol) %>%
+    left_join(renal_new_targets, by = "symbol")
+
+genes <- oldTargets %>%
+    bind_rows(newTargets) %>%
+    readr::write_csv(fs::path(data_dir, "resources/sightline_targets.csv"))
+
+genelist <- genes %>%
+     pull(gene_id) 
+
+gene_string <- paste0('(',
+                      genelist %>%
+                          stringr::str_c("'", ., "'") %>%
+                          stringr::str_flatten_comma(),
+                      ')')
+
+# get variants mapped to genes ('external' variants)
+# this will be replaced by retrieving variants from Sightline
+
+
+# get gnomad variants
+
+query_string <- paste("select chrom as chr, pos, ref, alt, gene_id from gnomad.gnomad_variant_consequence where gene_id in", gene_string)
+system.time({res <- noctua::dbExecute(con, query_string)})
+gnomad_output <- noctua::dbFetch(res) %>%
+    tibble::as_tibble() %>%
+    distinct()
+noctua::dbClearResult(res)
+
+gnomad_variants <- gnomad_output %>%
+    dplyr::mutate(class = "simple", source = "gnomad")
+
+# get open targets genetics variants
+query_string <- paste("select * from open_targets_genetics.v2g_scored where gene_id in",
+                      gene_string,
+                      "and overall_score > 0")
+system.time({res <- noctua::dbExecute(con, query_string)})
+otg_output <- noctua::dbFetch(res) %>%
+    tibble::as_tibble() %>%
+    distinct()
+noctua::dbClearResult(res)
+
+otg_variants <- otg_output %>%
+    dplyr::mutate(class = "simple", source = "otg") %>%
+    dplyr::rename(chr = chr_id,
+                  pos = position,
+                  ref = ref_allele,
+                  alt = alt_allele) %>%
+    dplyr::select(chr:alt, gene_id, class, source) %>%
+    distinct()
+
+# get variant_index variants
+query_string <- paste("select * from open_targets_genetics.variant_index where gene_id_any in", gene_string)
+system.time({res <- noctua::dbExecute(con, query_string)})
+variant_index_output <- noctua::dbFetch(res) %>%
+    tibble::as_tibble() %>%
+    dplyr::rename(gene_id = gene_id_any,
+                  chr = chr_id, pos = position, ref = ref_allele, alt = alt_allele)
+noctua::dbClearResult(res)
+
+variant_index_variants <- variant_index_output %>%
+    dplyr::mutate(class = "simple", source = "variant_index") %>%
+    dplyr::select(chr:alt, gene_id, class, source)
+
+
+# combine gnomad and otg variants
+external_variants <- gnomad_variants %>%
+    bind_rows(otg_variants) %>%
+    bind_rows(variant_index_variants) %>%
+    tidyr::unite("label", chr:alt, remove=FALSE)
+
+gene_id_to_symbol <- getBM(
+  mart = mart,
+  attributes = c('ensembl_gene_id','hgnc_symbol'),
+  filter = 'ensembl_gene_id',
+  values = unique(external_variants$gene_id),
+  uniqueRows = TRUE) %>%
+  tibble::as_tibble() %>%
+  dplyr::rename(gene_id = ensembl_gene_id,
+                symbol = hgnc_symbol) %>%
+  dplyr::select(gene_id, symbol)
+
+external_variants <- external_variants %>%
+    left_join(gene_id_to_symbol, by="gene_id") %>%
+    dplyr::select(label:gene_id, symbol, everything()) %>%
+    distinct() %>%
+    readr::write_csv(fs::path(data_dir, "resources/sightline_external_variants.csv"))
+
+gnomad_consequences <- gnomad_output %>%
+    dplyr::select(gene_id:alt) %>%
+    readr::write_csv(fs::path(data_dir, "resources/sightline_gnomad_consequences.csv"))
+
+```
+
+```{r kpmp-from-DGEList}
+kpmp_DGEList <- readRDS(fs::path(data_dir, "kpmp/pbulk-DGEList-cells.rds"))
+kpmp_cpms_cells <- cpm(kpmp_DGEList) %>%
+    tibble::as_tibble(rownames = "gene_id") %>%
+    tidyr::pivot_longer(-gene_id,
+                        names_to = "sample",
+                        values_to = "cpm") %>%
+    dplyr::left_join(kpmp_DGEList$samples %>% tibble::as_tibble(rownames = "sample"),
+                         by = "sample") %>%
+    dplyr::mutate(source = "pseudobulk-DGEList-cells") %>%
+    dplyr::select(gene_id,
+                  sample,
+                  cpm,
+                  cell_abbrev,
+                  cell_label,
+                  condition.l2,
+                  structure,
+                  source) %>%
+    readr::write_tsv(fs::path(data_dir, "kpmp/kpmp_cells_cpms.tsv"))
+
+kpmp_DGEList <- readRDS(fs::path(data_dir, "kpmp/pbulk-DGEList-nucs.rds"))
+kpmp_cpms_nucs <- cpm(kpmp_DGEList) %>%
+    tibble::as_tibble(rownames = "gene_id") %>%
+    tidyr::pivot_longer(-gene_id,
+                        names_to = "sample",
+                        values_to = "cpm") %>%
+    dplyr::left_join(kpmp_DGEList$samples %>% tibble::as_tibble(rownames = "sample"),
+                         by = "sample") %>%
+    dplyr::mutate(source = "pseudobulk-DGEList-nucs") %>%
+    dplyr::select(gene_id,
+                  sample,
+                  cpm,
+                  cell_abbrev,
+                  cell_label,
+                  condition.l2,
+                  structure,
+                  source) %>%
+    readr::write_tsv(fs::path(data_dir, "kpmp/kpmp_nucs_cpms.tsv"))
+
+kpmp_cpms_cells %>%
+    dplyr::bind_rows(kpmp_cpms_nucs) %>%
+    readr::write_tsv(fs::path(data_dir, "kpmp/kpmp_cpms.tsv"))
+```
+
+
+```{r get-new-targets-and-variants-from-ckan}
+# get low frequency and single missense creatinine variants for Renal New Targets
+# and combine with gnomad and otg variants
+
+LF_assoc_RVAS_genes_res_id <- "09140ada-d357-4171-b2ae-9cefbbaf24d1"
+SingleVariantMissenseCreatinine_res_id <- "6119b025-b083-4488-aea1-e81bdc258c48"
+    
+annotated_variants <- ckanr::ds_search(resource_id = LF_assoc_RVAS_genes_res_id,
+                 url = ckan_url,
+                 key = ckan_key,
+                 as = "table")$records %>%
+    tibble::as_tibble() %>%
+    dplyr::mutate(source = paste0("ckan:", LF_assoc_RVAS_genes_res_id)) %>%
+    bind_rows(ckanr::ds_search(resource_id = SingleVariantMissenseCreatinine_res_id,
+                 url = ckan_url,
+                 key = ckan_key,
+                 as = "table")$records %>%
+    tibble::as_tibble() %>%
+    dplyr::mutate(source = paste0("ckan:", SingleVariantMissenseCreatinine_res_id))) %>%
+    dplyr::select(-`_id`) %>%
+    tidyr::separate_wider_delim(`chr:pos`, delim = ":", names = c("chr", "pos_alleles")) %>%
+    tidyr::separate_wider_delim(pos_alleles, delim = "_", names = c("pos", "alleles")) %>%
+    tidyr::separate_wider_delim(alleles, delim = "/", names = c("ref", "alt")) %>%
+    dplyr::mutate(chr = stringr::str_remove(chr, "chr"),
+                  pos = as.integer(pos)) %>%
+    tidyr::unite("label", chr:alt, remove=FALSE) %>%
+    dplyr::rename(LoFbeta = `LoF beta`,
+                  symbol = gene)
+
+symbol_to_gene_id <- getBM(
+  mart = mart,
+  attributes = c('ensembl_gene_id','hgnc_symbol'),
+  filter = 'hgnc_symbol',
+  values = unique(annotated_variants$symbol),
+  uniqueRows = TRUE) %>%
+  tibble::as_tibble() %>%
+  dplyr::rename(gene_id = ensembl_gene_id,
+                symbol = hgnc_symbol) %>%
+  dplyr::select(gene_id, symbol)
+
+annotated_variants <- annotated_variants %>%
+    left_join(symbol_to_gene_id, by="symbol")
+
+internal_variants <- annotated_variants %>%
+    dplyr::mutate(class = "simple") %>%
+    dplyr::select(label:alt, gene_id, symbol, class, source) %>%
+    readr::write_csv(fs::path(data_dir, "resources/sightline_internal_variants.csv"))
+```
+
+
+```{r assemble-all-variants}
+
+all_variants <- external_variants %>%
+    bind_rows(internal_variants) %>%
+    group_by(label) %>%
+    dplyr::mutate(sources = paste0(source, collapse = ",")) %>%
+    dplyr::select(label, chr:alt, class, sources) %>%
+    readr::write_csv(fs::path(data_dir, "resources/sightline_variants.csv"))
+
+```
+
+
+```{r build-ckan-gene-and-variant-packages-and-resources, eval=FALSE}
+sightline_org_id <- "acd65bfd-df6d-4297-ae33-ab837864b022"
+sightline_catalog_pkg_id <- "6035361d-871c-4e24-a027-e044fe5d42a7"
+sightline_genes_catalog_res_id <- "7f7d302e-f5ab-49e2-812d-8d77473e9ab0"
+# sightline_variants_catalog_res_id <- "0be2b3a3-4aea-4d4d-b208-3f096f50faba"
+sightline_internal_variants_catalog_res_id <- "fbddef6d-b3b3-4386-933d-50be682648e6"
+# sightline_external_variants_catalog_res_id <- "06652183-01a5-4e4a-bc6f-6f8aedc26b7f"
+
+
+# gene catalog
+res <- ckanr::resource_create(package_id = sightline_catalog_pkg_id,
+                       name = "genes",
+                       description = "genes in the Sightline catalog",
+                       upload = fs::path(data_dir, "resources/sightline_targets.csv"),
+                       url = ckan_url,
+                       key = ckan_key)
+sightline_genes_catalog_res_id <- res$id
+
+# variant catalog--too big!
+# res <- ckanr::resource_create(package_id = sightline_catalog_pkg_id,
+#                        name = "variants",
+#                        description = "variants in the Sightline catalog",
+#                        upload = fs::path(data_dir, "resources/sightline_variants.csv"),
+#                        url = ckan_url,
+#                        key = ckan_key)
+# sightline_variants_catalog_res_id <- res$id
+
+res <- ckanr::resource_create(package_id = sightline_catalog_pkg_id,
+                       name = "internal",
+                       description = "internally identified variants",
+                       upload = fs::path(data_dir, "resources/sightline_internal_variants.csv"),
+                       url = ckan_url,
+                       key = ckan_key)
+sightline_external_variants_catalog_res_id <- res$id
+
+# external variant catalog--too big!
+# res <- ckanr::resource_create(package_id = sightline_catalog_pkg_id,
+#                        name = "external",
+#                        description = "Variants mapped to genes in the Sightline catalog by external sources",
+#                        upload = fs::path(data_dir, "resources/sightline_external_variants.csv"),
+#                        url = ckan_url,
+#                        key = ckan_key)
+# sightline_external_variants_catalog_res_id <- res$id
+
+```
+
+```{r update-ckan-gene-and-variant-packages-and-resources}
+sightline_org_id <- "acd65bfd-df6d-4297-ae33-ab837864b022"
+sightline_catalog_pkg_id <- "6035361d-871c-4e24-a027-e044fe5d42a7"
+sightline_genes_catalog_res_id <- "7f7d302e-f5ab-49e2-812d-8d77473e9ab0"
+#sightline_variants_catalog_res_id <- "0be2b3a3-4aea-4d4d-b208-3f096f50faba"
+sightline_internal_variants_catalog_res_id <- "fbddef6d-b3b3-4386-933d-50be682648e6"
+#sightline_external_variants_catalog_res_id <- "06652183-01a5-4e4a-bc6f-6f8aedc26b7f"
+
+# gene catalog
+res <- ckanr::resource_update(
+    id = sightline_genes_catalog_res_id,
+    path = fs::path(data_dir, "resources/sightline_targets.csv"),
+    url = ckan_url,
+    key = ckan_key,
+    as = "list"
+)
+
+# variant catalog
+# res <- ckanr::resource_update(
+#     id = sightline_variants_catalog_res_id,
+#     path = fs::path(data_dir, "resources/sightline_variants.csv"),
+#     url = ckan_url,
+#     key = ckan_key,
+#     as = "list"
+# )
+
+# internal variants
+res <- ckanr::resource_update(
+    id = sightline_internal_variants_catalog_res_id,
+    path = fs::path(data_dir, "resources/sightline_internal_variants.csv"),
+    url = ckan_url,
+    key = ckan_key,
+    as = "list"
+)
+
+# external variants
+# res <- ckanr::resource_update(
+#     id = sightline_external_variants_catalog_res_id,
+#     path = fs::path(data_dir, "resources/sightline_external_variants.csv"),
+#     url = ckan_url,
+#     key = ckan_key,
+#     as = "list"
+# )
+
+
+```
+
+
+
+
+```{r build-ckan-gene-and-variant-set-summary-packages-and-resources}
+
+# Package to store summaries across sets of genes
+pkg <- ckanr::package_create(name="gene_summaries",
+                             title="Annotations of genes in the Sightline catalog",
+                             notes="",
+                             author="Matt Brauer",
+                             author_email="mbrauer@mazetx.com",
+                             maintainer="Matt Brauer",
+                             maintainer_email="mbrauer@mazetx.com",
+                             owner_org=sightline_org_id,
+                             url=ckan_url,
+                             key=ckan_key
+)
+
+sightline_genes_summary_pkg_id <- pkg$id
+
+```
+
+
+
+
+
+```{r get-genes-from-ckan, eval=FALSE}
+
+genes <- ckanr::ds_search(resource_id = sightline_genes_catalog_res_id,
+                 as="table")$records %>%
+  tibble::as_tibble() %>%
+  dplyr::select(-`_id`) %>%
+  saveRDS(fs::path(data_dir, "genes.rds"))
+
+```
+
+```{r get-intenral-variants-from-ckan, eval=FALSE}
+
+variants <- ckanr::ds_search(resource_id = sightline_internal_variants_catalog_res_id,
+                 as="table")$records %>%
+  tibble::as_tibble() %>%
+  dplyr::select(-`_id`) %>%
+  saveRDS(fs::path(data_dir, "genes.rds"))
+
+```
+
+
+
+```{r load-from-gtex-site, eval=FALSE}
+gtex_data_pkg_id <- "0d230f54-6d62-4c1e-889f-242221cb2a40"
+  
+gtex_v8_rpkms <- readr::read_tsv("../data/GTEx/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_reads.gct", skip = 2)
+
+gtex_v8_rpkms <- gtex_v8_rpkms %>%
+  dplyr::rename(symbol = Description) %>%
+  tidyr::separate_wider_delim(Name, ".", names = c("gene_id", "gene_id_version")) %>%
+  dplyr::select(gene_id, gene_id_version, symbol, everything()) %>%
+  readr::write_csv(fs::path(tempdir, "gtex_v8_rpkms.csv"))
+
+
+gtex_v8_tpm <- readr::read_tsv(fs::path(data_dir, "GTEx/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_tpm.gct"), skip = 2)
+
+gtex_v8_tpm <- gtex_v8_tpm %>%
+  dplyr::rename(symbol = Description) %>%
+  tidyr::separate_wider_delim(Name, ".", names = c("gene_id", "gene_id_version")) %>%
+  dplyr::select(gene_id, gene_id_version, symbol, everything()) %>%
+  readr::write_csv(fs::path(tempdir, "gtex_v8_tpm.csv"))
+
+
+gtex_v8_median <- readr::read_tsv(fs::path(data_dir, "GTEx/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_median_tpm.gct"), skip = 2) 
+
+gtex_v8_median <- gtex_v8_median %>%
+  dplyr::rename(symbol = Description) %>%
+  tidyr::separate_wider_delim(Name, ".", names = c("gene_id", "gene_id_version")) %>%
+  dplyr::select(gene_id, gene_id_version, symbol, everything()) %>%
+  readr::write_csv(fs::path(tempdir, "gtex_v8_median.csv"))
+
+
+gtex_v8_samples <- readr::read_tsv("../data/GTEx/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt") %>%
+  readr::write_csv(fs::path(tempdir, "gtex_v8_samples.csv"))
+
+
+gtex_v8_phenotypes <- readr::read_tsv("../data/GTEx/GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt") %>%
+  readr::write_csv(fs::path(tempdir, "gtex_v8_phenotypes.csv"))
+
+
+rpkms <- gtex_v8_rpkms %>%
+  top_n(10) %>%
+  pivot_longer(cols = c(-gene_id, -symbol), names_to = "SAMPID", values_to = "expression") %>%
+  left_join(gtex_v8_samples %>% dplyr::select(SAMPID, SMTS, SMTSD), by="SAMPID") %>%
+  dplyr::rename(Tissue = SMTS, Subtissue = SMTSD)
+
+rpkms %>%
+  dplyr::filter(symbol == "EEF1A1") %>%
+  ggplot(aes(x=Tissue, y=expression)) +
+  geom_boxplot()
+
+
+## HPA
+gtex <- readr::read_tsv(fs::path(data_dir, "hpa/rna_tissue_gtex.tsv")) %>%
+  dplyr::rename(gene_id = Gene, symbol = `Gene name`)
+hpa <- readr::read_tsv(fs::path(data_dir, "hpa/rna_tissue_hpa.tsv")) %>%
+  dplyr::rename(gene_id = Gene, symbol = `Gene name`)
+consensus <- readr::read_tsv(fs::path(data_dir, "hpa/rna_tissue_gtex.tsv")) %>%
+  dplyr::rename(gene_id = Gene, symbol = `Gene name`)
+
+normal_tissue <- readr::read_tsv(fs::path(data_dir, "hpa/normal_tissue.tsv")) %>%
+  dplyr::rename(gene_id = Gene, symbol = `Gene name`, cell_type = `Cell type`) %>%
+  dplyr::mutate(level = if_else(Level %in% c("Medium","Low","High"), Level, "ND"),
+                level = ordered(level, levels = c("ND", "Low", "Medium", "High")),
+                value = as.integer(level) - 1) %>%
+  tidyr::unite(tissue_cell, Tissue:cell_type, remove = FALSE)
+
+```
