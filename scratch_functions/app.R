@@ -7,7 +7,7 @@ library(jsonlite)
 library(TissueEnrich)
 library(flextable)
 
-data_dir <- "/data/AutoAnnotate"
+data_dir <- "/data/AnnotationEngine"
 
 # Define the list of genes and annotations
 genes <- readRDS(fs::path(data_dir, "genes.rds"))

@@ -1,10 +1,10 @@
-Package: AutoAnnotate
+Package: AnnotationEngine
 Title: Publishes Annotation Artifacts for Sets of Genes and Variants
 Version: 0.0.0.9000
 Authors@R: 
     person("Matt", "Brauer", , "mbrauer@mazetx.com", role = c("aut", "cre"),
            comment = c(ORCID = "YOUR-ORCID-ID"))
-Description: AutoAnnotate reads from a CKAN catalog of genes and variants and
+Description: AnnotationEngine reads from a CKAN catalog of genes and variants and
     annotates these from resources in Athena and elsewhere. The package builds
     sets of annotation artifacts (tables and figures) and can publish these
     to a CKAN organization.

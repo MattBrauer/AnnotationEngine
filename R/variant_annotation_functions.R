@@ -56,6 +56,7 @@ annotate_variants <- function(variantlist,
         distinct() %>%
         tibble::deframe()
 
+    #TODO: map variants to canonical proteins to add lolliplot or dandelion plot
     variant_annotation <- list(
         metadata = list(ensembl = variantlist %>% left_join(annotation, by="gene_id"),
                         tissue = tissue,
@@ -65,6 +66,10 @@ annotate_variants <- function(variantlist,
                         edb = edb,
                         genes = symbols,
                         variants = variants,
+                        variant_granges = setNames(GRanges(seqnames=paste0("chr", variantlist$chr),
+                                                  ranges=IRanges(start=variantlist$pos, width=1),
+                                                  mcols=variantlist),
+                                                  variantlist$label),
                         gene_string = paste0('(',
                                              names(symbols) %>%
                                                  stringr::str_c("'", ., "'") %>%

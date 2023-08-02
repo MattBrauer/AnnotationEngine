@@ -29,7 +29,7 @@ library(flextable)
 library(edgeR)
 library(biomaRt)
 
-data_dir <- "/data/AutoAnnotate"
+data_dir <- "/data/AnnotationEngine"
 
 tempdir <- tempdir()
 

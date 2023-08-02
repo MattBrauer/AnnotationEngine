@@ -50,9 +50,14 @@ library(kableExtra)
 library(flextable)
 library(edgeR)
 library(AnnotationHub)
-devtools::load_all() # to be replaced with library(AutoAnnotate)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(org.Hs.eg.db)
+library(rtracklayer)
+library(trackViewer)
+library(VariantEngine)
+devtools::load_all() # to be replaced with library(AnnotationEngine)
 
-data_dir <- "/data/AutoAnnotate"
+data_dir <- "/data/AnnotationEngine"
 
 out_dir <- tempdir()
 
@@ -71,7 +76,11 @@ ckanr::ckanr_setup(url = ckan_url, key = ckan_key)
 ah <- AnnotationHub()
 edb_Hs <- ah[["AH109606"]]
 edb_Mm <- ah[["AH109655"]]
+txdb_Hs <- ah[["AH111585"]]
+txdb_Mm <- ah[["AH75762"]]
+org_Hs <- ah[["AH111575"]]
 ```
+
 
 
 
@@ -772,5 +781,5 @@ knitr::opts_chunk$set(
 ```
 
 ```{r setup}
-library(AutoAnnotate)
+library(AnnotationEngine)
 ```

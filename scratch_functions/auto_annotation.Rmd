@@ -51,7 +51,7 @@ library(flextable)
 library(edgeR)
 library(AnnotationHub)
 
-data_dir <- "/data/AutoAnnotate"
+data_dir <- "/data/AnnotationEngine"
 
 tempdir <- tempdir()
 
