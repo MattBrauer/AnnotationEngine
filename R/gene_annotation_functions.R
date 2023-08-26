@@ -7,6 +7,7 @@
 #' @param tissue A character string (default "all") specifying the focal tissue
 #' @param data_dir The location where output will be placed
 #' @param edb An `edb` object, specific to species
+#' @param con A DBI connection to the relevant database
 #'
 #' @return A list containing the annotation artifacts created, as files, in
 #'  `data_dir`
@@ -16,9 +17,12 @@ annotate_genes <- function(genelist,
                            tissue = "all",
                            data_dir,
                            out_dir,
-                           edb = edb_Hs) {
+                           edb = edb_Hs,
+                           con) {
 
-    genes_edb <- suppressWarnings(genes(edb))
+    genes_edb <- suppressWarnings(genes(edb,
+                                        filter = GeneIdFilter(genelist$gene_id,
+                                                              "==")))
 
     warnings <- list()
 
@@ -38,8 +42,7 @@ annotate_genes <- function(genelist,
         warning("Not all genes in geneset map to gene_ids")
         warnings[["ensembl_annotation_failures"]] <- genelist$gene_id[!is_valid]
     }
-    annotation_granges <- genes_edb[genes_edb$gene_id %in% genelist$gene_id[is_valid]]
-    annotation <- mcols(annotation_granges) %>%
+    annotation <- mcols(genes_edb) %>%
         tibble::as_tibble() %>%
         dplyr::select(gene_id, symbol, description,
                       gene_id_version, gene_biotype, canonical_transcript)
@@ -61,9 +64,7 @@ annotate_genes <- function(genelist,
                                                  stringr::str_c("'", ., "'") %>%
                                                  stringr::str_flatten_comma(),
                                              ')'),
-                        con = noctua::dbConnect(noctua::athena(),
-                                                profile_name = user_profile,
-                                                s3_staging_dir = s3_staging_dir)),
+                        con = con),
         warnings = warnings,
         datasets = list()
             # name, description, resources
@@ -273,6 +274,17 @@ annotate_gene_tissue_hpa_specificity <- function(gene_annotation) {
                                                 "High"))) - 1)
     noctua::dbClearResult(res)
 
+    ## heatmap of HPA protein detection by tissue
+    plotfile <- fs::path(gene_annotation$metadata$out_dir,
+                         stringr::str_replace_all(paste0(gene_annotation$metadata$setname,
+                                                         "_HPA_tissue_protein_heatmap.png"),
+                                                  " ", "_"))
+
+    plot_title <- ifelse(gene_annotation$metadata$setname=="all",
+                         "Tissue protein detection of all genes",
+                         paste("Tissue protein detection for genes from",
+                               gene_annotation$metadata$setname))
+
     p <- hpa %>%
         dplyr::group_by(gene_id, symbol, tissue) %>%
         dplyr::summarize(max_detection = max(protein)) %>%
@@ -282,95 +294,10 @@ annotate_gene_tissue_hpa_specificity <- function(gene_annotation) {
         scale_fill_gradient(low = "white", high = "steelblue")+
         labs(x='', y = '') +
         theme_bw() +
-        ggtitle(paste("Tissue protein detection for genes from", filter_context)) +
-        guides(fill = guide_legend(title = "Protein level")) +
-        #theme(legend.position="none") +
-        theme(plot.title = element_text(hjust = 0.5,size = 20),axis.title = element_text(size=15))+
-        theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),panel.grid.major= element_blank(),panel.grid.minor = element_blank())
-
-    q <- hpa %>%
-        dplyr::filter(tissue == filter_tissue) %>%
-        dplyr::select(symbol, cell_type, protein) %>%
-        ggplot(aes(symbol, cell_type)) +
-        geom_tile(aes(fill = protein), colour = "white") +
-        scale_fill_gradient(low = "white", high = "steelblue")+
-        labs(x = '', y = '') +
-        theme_bw() +
-        guides(fill = guide_legend(title = "Protein Level")) +
-        ggtitle(paste("Protein detection in", filter_tissue, "for genes from", filter_context)) +
-        #theme(legend.position="none") +
-        theme(plot.title = element_text(hjust = 0.5,size = 20),axis.title = element_text(size=15)) +
-        theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
-              panel.grid.major= element_blank(),panel.grid.minor = element_blank())
-
-
-    ## boxplots of GTEx TPMs by tissue
-    dataset$resources <- setNames(lapply(names(gene_annotation$metadata$genes),
-                                         function(focal_gene_id) {
-                                             gene <- list()
-
-                                             focal_symbol <- gene_annotation$metadata$genes[[focal_gene_id]]
-
-                                             plotfile <- fs::path(gene_annotation$metadata$out_dir,
-                                                                  paste0(focal_symbol, "_GTEx_tissue_expn_boxplot.png"))
-
-                                             p <- gtex_boxplot(tpm, focal_gene_id, focal_symbol, tissue)
-
-                                             png(plotfile)
-                                             print(p)
-                                             dev.off()
-
-                                             gene <- list(filename = plotfile,
-                                                          dataset_name = dataset$name,
-                                                          resource_name = "GTEx_tissue_expn_boxplot",
-                                                          type = "png",
-                                                          published = FALSE,
-                                                          cleared = FALSE)
-                                             return(gene)
-                                         }),
-                                  gene_annotation$metadata$genes)
-
-    ## heatmap of gtex gene expression (from HPA) across geneset
-    query_string <- paste("select gene_id, symbol, tissue, value",
-                          "from hpa.gene_expression where measurement='nTPM'",
-                          "and source='gtex'", #consensus'",
-                          "and gene_id in",
-                          gene_annotation$metadata$gene_string)
-    res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
-    tpm <- noctua::dbFetch(res) %>%
-        tibble::as_tibble() %>%
-        dplyr::mutate(tissue = stringr::str_to_title(tissue))
-    noctua::dbClearResult(res)
-
-    tpm <- tpm %>%
-        left_join(tpm %>%
-                      group_by(gene_id) %>%
-                      summarize(median_tpm = median(value),
-                                sd_tpm = sd(value)),
-                  by="gene_id") %>%
-        dplyr::mutate(expn = (value - median_tpm)/sd_tpm)
-
-    ## heatmap of consensus from GTEx and HPA TPMs by tissue
-    plotfile <- fs::path(gene_annotation$metadata$out_dir,
-                         stringr::str_replace_all(paste0(gene_annotation$metadata$setname,
-                                                         "_GTEx_HPA_tissue_expn_heatmap.png"),
-                                                  " ", "_"))
-
-    plot_title <- ifelse(gene_annotation$metadata$setname=="all",
-                         "Median-normalized tissue expression of all genes",
-                         paste("Median-normalized tissue expression of genes from",
-                               gene_annotation$metadata$setname))
-
-    p <- tpm %>%
-        dplyr::select(symbol, tissue, expn) %>%
-        ggplot(aes(symbol, tissue)) +
-        geom_tile(aes(fill = expn), colour = "white") +
-        scale_fill_gradient(low = "white", high = "steelblue") +
-        labs(x='', y = '') +
-        theme_bw() +
         ggtitle(plot_title) +
-        guides(fill = guide_legend(title = "expression",
+        guides(fill = guide_legend(title = "Protein level",
                                    title.hjust = 0.5)) +
+        #theme(legend.position="none") +
         theme(plot.title = element_text(hjust = 0.5,size = 40),
               axis.title = element_text(size=15),
               axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 24),
@@ -387,7 +314,94 @@ annotate_gene_tissue_hpa_specificity <- function(gene_annotation) {
 
     dataset$resources$aggregate <- list(filename = plotfile,
                                         dataset_name = dataset$name,
-                                        resource_name = "HPA_tissue_expn_heatmap",
+                                        resource_name = "HPA_tissue_protein_heatmap",
+                                        type = "png",
+                                        published = FALSE,
+                                        cleared = FALSE)
+
+    gene_annotation$datasets[[dataset$name]] <- dataset
+
+    return(gene_annotation)
+}
+
+#' Generate gene expression annotations
+#'
+#' @description Generate gene annotation artifacts for tissue-specific expression
+#'
+#' @param gene_annotation A list as output by 'annotate_genes'
+#'
+#' @return A list as output by 'annotate_genes', with gene expression annotation
+#' artifact locations added
+#' @export
+annotate_gene_tissue_celltype_hpa_specificity <- function(gene_annotation) {
+
+    dataset <- list(name = tolower(paste("tissue_celltype_hpa_expn",
+                                         stringr::str_replace_all(gene_annotation$metadata$setname,
+                                                                  "[^[a-z][A-Z][0-9][-_]]",
+                                                                  "_"), sep ="_")),
+                    description = paste("Tissue-specific celltype protein expression of",
+                                        ifelse(gene_annotation$metadata$setname=="all",
+                                               "all genes",
+                                               paste("genes from",
+                                                     gene_annotation$metadata$setname))),
+                    published = FALSE,
+                    cleared = FALSE)
+    ## HPA
+    query_string <- paste("select *",
+                          "from hpa.protein_detection where",
+                          "gene_id in",
+                          gene_annotation$metadata$gene_string)
+    res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
+    hpa <- noctua::dbFetch(res) %>%
+        tibble::as_tibble() %>%
+        dplyr::mutate(protein = as.numeric(factor(protein,
+                                                  levels=c("Not detected",
+                                                           "Low",
+                                                           "Medium",
+                                                           "High"))) - 1)
+    noctua::dbClearResult(res)
+
+    ## heatmap of HPA protein detection within tissue
+    plotfile <- fs::path(gene_annotation$metadata$out_dir,
+                         stringr::str_replace_all(paste(gene_annotation$metadata$setname,
+                                                        filter_tissue,
+                                                        "HPA_tissue_protein_heatmap.png"),
+                                                  " ", "_"))
+
+    plot_title <- ifelse(gene_annotation$metadata$setname=="all",
+                         "Tissue protein detection of all genes",
+                         paste("Protein detection in", filter_tissue,
+                               "for genes from", gene_annotation$metadata$setname))
+
+    p <- hpa %>%
+        dplyr::filter(tissue == filter_tissue) %>%
+        dplyr::select(symbol, cell_type, protein) %>%
+        ggplot(aes(symbol, cell_type)) +
+        geom_tile(aes(fill = protein), colour = "white") +
+        scale_fill_gradient(low = "white", high = "steelblue")+
+        labs(x = '', y = '') +
+        theme_bw() +
+        ggtitle(plot_title) +
+        guides(fill = guide_legend(title = "Protein level",
+                               title.hjust = 0.5)) +
+        theme(plot.title = element_text(hjust = 0.5,size = 40),
+              axis.title = element_text(size=15),
+              axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 24),
+              axis.text.y = element_text(size = 18),
+              legend.key.size = unit(60, 'points'),
+              legend.title = element_text(size = 18),
+              legend.text = element_text(size = 18),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank())
+
+
+    png(plotfile, width = 1920, height = 960)
+    print(p)
+    dev.off()
+
+    dataset$resources$aggregate <- list(filename = plotfile,
+                                        dataset_name = dataset$name,
+                                        resource_name = "HPA_tissue_specific_protein_heatmap",
                                         type = "png",
                                         published = FALSE,
                                         cleared = FALSE)

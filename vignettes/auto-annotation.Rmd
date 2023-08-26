@@ -40,12 +40,22 @@ or "Variant Summaries" package within the Sightline CKAN organization.
 knitr::opts_chunk$set(eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE,
                       fig.width=12, fig.height=8)
 
+BiocManager::install(c("TissueEnrich",
+                       "AnnotationHub",
+                       "TxDb.Hsapiens.UCSC.hg38.knownGene",
+                       "org.Hs.eg.db",
+                       "rtracklayer",
+                       "trackViewer"))
+install.packages(c("janitor"))
+devtools::install_github(c("mazetx/VariantEngine",
+                           "mazetx/mazer"))
+
 library(rlang)
 library(tidyverse)
 library(janitor)
 library(ckanr)
 library(jsonlite)
-library(TissueEnrich) # look at Gordon Smyth's reimplemtation of GOseq
+library(TissueEnrich) # bioc; look at Gordon Smyth's reimplemtation of GOseq
 library(kableExtra)
 library(flextable)
 library(edgeR)
@@ -54,16 +64,16 @@ library(TxDb.Hsapiens.UCSC.hg38.knownGene)
 library(org.Hs.eg.db)
 library(rtracklayer)
 library(trackViewer)
-library(VariantEngine)
+library(VariantEngine) # devtools::install_github("mazetx/VariantEngine")
+library(mazer) # devtools::install_github("mazetx/mazer")
+library(DBI)
 devtools::load_all() # to be replaced with library(AnnotationEngine)
 
 data_dir <- "/data/AnnotationEngine"
 
 out_dir <- tempdir()
 
-# Set S3 staging directory and AWS profile: requires a profile of `profile_name` in `~/.aws/config` file
-s3_staging_dir <- 's3://aws-athena-query-results-169945233738-us-west-2/'
-user_profile <- 'superuser'
+con <- mazer::athena_connect(json = "auto")
 
 # suppress breaking error
 options(rstudio.connectionObserver.errorsSuppressed = TRUE)
@@ -79,13 +89,6 @@ edb_Mm <- ah[["AH109655"]]
 txdb_Hs <- ah[["AH111585"]]
 txdb_Mm <- ah[["AH75762"]]
 org_Hs <- ah[["AH111575"]]
-```
-
-
-
-
-```{sh get-credentials, eval=FALSE, echo=FALSE}
-aws sso login
 ```
 
 
@@ -151,7 +154,8 @@ gene_annotation <- annotate_genes(genelist,
                                   tissue = filter_tissue,
                                   data_dir = data_dir,
                                   out_dir = out_dir,
-                                  edb = edb_Hs)
+                                  edb = edb_Hs,
+                                  con = con)
 
 variantlist <- ckanr::ds_search(resource_id = sightline_variants_catalog_res_id,
                                 limit = 25000,
@@ -168,7 +172,8 @@ variant_annotation <- annotate_variants(genelist %>%
                                         setname = filter_context,
                                         tissue = filter_tissue,
                                         data_dir = data_dir,
-                                        edb = edb_Hs)
+                                        edb = edb_Hs,
+                                        con = con)
 
 ```
 
@@ -187,17 +192,24 @@ gene_annotation <- annotate_gene_tissue_rna_specificity(gene_annotation)
 gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_org, prefix = "01a")
 ```
 
-```{r tissue-expression}
+```{r tissue-protein}
 ## 1b. Tissue specificity
 gene_annotation <- annotate_gene_tissue_hpa_specificity(gene_annotation)
 gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_org, prefix = "01b")
 ```
 
-```{r cell-type-expression}
-## 2. Cell type specificity within tissue
+```{r kidney-cell-type-expression}
+## 2a. Cell type specificity within tissue
 gene_annotation <- annotate_gene_cell_type_specificity_kpmp(gene_annotation)
-gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_org, prefix = "02")
+gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_org, prefix = "02a")
 ```
+
+```{r kidney-cell-type-protein}
+## 2b. Cell type specificity within tissue
+gene_annotation <- annotate_gene_tissue_celltype_hpa_specificity(gene_annotation)
+gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_org, prefix = "02b")
+```
+
 
 ```{r phewas-general}
 ## 3. PheWAS readouts, general
@@ -256,7 +268,7 @@ gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_or
 ```{r clean-up}
 
 # close connection
-
+dbDisconnect(con)
 ```
 
 

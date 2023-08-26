@@ -8,7 +8,6 @@ gtex_boxplot <- function(dataset, focal_gene_id, focal_symbol, tissue) {
         theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
 }
 
-
 kpmp_boxplot <- function(dataset, focal_gene_id, focal_symbol, tissue) {
     dataset %>%
         dplyr::filter(symbol==focal_symbol) %>%
