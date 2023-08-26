@@ -149,7 +149,7 @@ genelist <- ckanr::ds_search(resource_id = sightline_genes_catalog_res_id,
     dplyr::filter(if(filter_context != "all") context == filter_context else TRUE) %>%
     distinct()
 
-gene_annotation <- annotate_genes(genelist,
+gene_annotation_base <- annotate_genes(genelist,
                                   setname = filter_context,
                                   tissue = filter_tissue,
                                   data_dir = data_dir,
@@ -188,25 +188,25 @@ Output 2:
 
 ```{r tissue-expression}
 ## 1a. Tissue specificity
-gene_annotation <- annotate_gene_tissue_rna_specificity(gene_annotation)
+gene_annotation <- annotate_gene_tissue_rna_specificity(gene_annotation_base)
 gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_org, prefix = "01a")
 ```
 
 ```{r tissue-protein}
 ## 1b. Tissue specificity
-gene_annotation <- annotate_gene_tissue_hpa_specificity(gene_annotation)
+gene_annotation <- annotate_gene_tissue_hpa_specificity(gene_annotation_base)
 gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_org, prefix = "01b")
 ```
 
 ```{r kidney-cell-type-expression}
 ## 2a. Cell type specificity within tissue
-gene_annotation <- annotate_gene_cell_type_specificity_kpmp(gene_annotation)
+gene_annotation <- annotate_gene_cell_type_specificity_kpmp(gene_annotation_base)
 gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_org, prefix = "02a")
 ```
 
 ```{r kidney-cell-type-protein}
 ## 2b. Cell type specificity within tissue
-gene_annotation <- annotate_gene_tissue_celltype_hpa_specificity(gene_annotation)
+gene_annotation <- annotate_gene_tissue_celltype_hpa_specificity(gene_annotation_base)
 gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_org, prefix = "02b")
 ```
 
