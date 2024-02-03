@@ -127,22 +127,21 @@ annotate_gene_tissue_rna_specificity <- function(gene_annotation) {
     query_string <- paste("select SAMPID as sample, SMTS as Tissue, SMTSD as Subtissue",
                           "from gtex.samples")
 
-    res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
-    samples <- noctua::dbFetch(res) %>%
+    #    res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
+    res <- mazer::athena_query(query_string, gene_annotation$metadata$con)
+    samples <- res %>%
         tibble::as_tibble() %>%
         dplyr::rename(tissue = Tissue, subtissue = Subtissue)
-    noctua::dbClearResult(res)
 
     # GTEx TPMs
     query_string <- paste("select split_part(gene_id, '.', 1) as gene_id, symbol, sample, value",
                           "from gtex.v8 where measurement_type='gene_tpm'",
                           "and split_part(gene_id, '.', 1) in",
                           gene_annotation$metadata$gene_string)
-    res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
-    tpm <- noctua::dbFetch(res) %>%
+    res <- mazer::athena_query(query_string, gene_annotation$metadata$con)
+    tpm <- res %>%
         tibble::as_tibble() %>%
         left_join(samples, by="sample")
-    noctua::dbClearResult(res)
 
     ## boxplots of GTEx TPMs by tissue
     dataset$resources <- setNames(lapply(names(gene_annotation$metadata$genes),
@@ -164,6 +163,7 @@ annotate_gene_tissue_rna_specificity <- function(gene_annotation) {
                      dataset_name = dataset$name,
                      resource_name = paste(focal_symbol, "gtex_tissue_expn_boxplot", sep="_"),
                      type = "png",
+                     plot = p,
                      published = FALSE,
                      cleared = FALSE)
         return(gene)
@@ -176,11 +176,12 @@ annotate_gene_tissue_rna_specificity <- function(gene_annotation) {
                           "and source='gtex'", #consensus'",
                           "and gene_id in",
                           gene_annotation$metadata$gene_string)
-    res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
-    tpm <- noctua::dbFetch(res) %>%
+    #res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
+    res <- mazer::athena_query(query_string, gene_annotation$metadata$con)
+
+    tpm <- res %>%
         tibble::as_tibble() %>%
         dplyr::mutate(tissue = stringr::str_to_title(tissue))
-    noctua::dbClearResult(res)
 
     tpm <- tpm %>%
         left_join(tpm %>%
@@ -189,6 +190,15 @@ annotate_gene_tissue_rna_specificity <- function(gene_annotation) {
                                 sd_tpm = sd(value)),
                   by="gene_id") %>%
         dplyr::mutate(expn = (value - median_tpm)/sd_tpm)
+
+    ## Example use of `tpm`
+    # tpm %>% readr::write_csv(fs::path(out_dir, "gtex_expn_renal_new_targets", ext="csv"))
+    # ckanr::package_search("tissue_rna_expn_renal_new_targets_2023")
+    # ckanr::resource_create(package_id = "d850149c-3113-4b12-801b-eb6c6c76f88f",
+    #                        name="gtex_data_renal_new_targets",
+    #                        description="GTEx expression data for renal new targets",
+    #                        format="CSV", upload=fs::path(out_dir, "gtex_expn_renal_new_targets", ext="csv"))
+
 
     ## heatmap of consensus from GTEx and HPA TPMs by tissue
     plotfile <- fs::path(gene_annotation$metadata$out_dir,
@@ -229,6 +239,7 @@ annotate_gene_tissue_rna_specificity <- function(gene_annotation) {
                                         dataset_name = dataset$name,
                                         resource_name = "GTEx_tissue_expn_heatmap",
                                         type = "png",
+                                        plot = p,
                                         published = FALSE,
                                         cleared = FALSE)
 
@@ -264,15 +275,16 @@ annotate_gene_tissue_hpa_specificity <- function(gene_annotation) {
                           "from hpa.protein_detection where",
                           "gene_id in",
                           gene_annotation$metadata$gene_string)
-    res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
-    hpa <- noctua::dbFetch(res) %>%
+    #res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
+    res <- mazer::athena_query(query_string, gene_annotation$metadata$con)
+
+    hpa <- res %>%
         tibble::as_tibble() %>%
         dplyr::mutate(protein = as.numeric(factor(protein,
                                        levels=c("Not detected",
                                                 "Low",
                                                 "Medium",
                                                 "High"))) - 1)
-    noctua::dbClearResult(res)
 
     ## heatmap of HPA protein detection by tissue
     plotfile <- fs::path(gene_annotation$metadata$out_dir,
@@ -351,15 +363,16 @@ annotate_gene_tissue_celltype_hpa_specificity <- function(gene_annotation) {
                           "from hpa.protein_detection where",
                           "gene_id in",
                           gene_annotation$metadata$gene_string)
-    res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
-    hpa <- noctua::dbFetch(res) %>%
+    #res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
+    res <- mazer::athena_query(query_string, gene_annotation$metadata$con)
+
+    hpa <- res %>%
         tibble::as_tibble() %>%
         dplyr::mutate(protein = as.numeric(factor(protein,
                                                   levels=c("Not detected",
                                                            "Low",
                                                            "Medium",
                                                            "High"))) - 1)
-    noctua::dbClearResult(res)
 
     ## heatmap of HPA protein detection within tissue
     plotfile <- fs::path(gene_annotation$metadata$out_dir,
@@ -440,9 +453,10 @@ annotate_gene_cell_type_specificity_kpmp <- function(gene_annotation) {
                           "where source ='pseudobulk-DGEList-cells'",
                           "and gene_id in",
                           gene_annotation$metadata$gene_string)
-    res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
-    cpm <- noctua::dbFetch(res)
-    noctua::dbClearResult(res)
+    #res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
+    res <- mazer::athena_query(query_string, gene_annotation$metadata$con)
+
+    cpm <- res
 
     kpmp_pseudobulk <- cpm %>%
         tibble::as_tibble() %>%
@@ -509,6 +523,17 @@ annotate_gene_cell_type_specificity_kpmp <- function(gene_annotation) {
                                 sd_cpm = sd(cpm)),
                   by="gene_id") %>%
         dplyr::mutate(expn = (cpm - median_cpm)/sd_cpm)
+
+    median_expn %>% readr::write_csv(fs::path(out_dir))
+
+    # # Example use of `median_expn`
+    # median_expn %>% readr::write_csv(fs::path(out_dir, "kpmp_expn_renal_new_targets", ext="csv"))
+    # ckanr::package_search("kpmp_kidney_celltype_rna_expn_renal_new_targets_2023")
+    # # "2912fa34-a3b8-41a5-aedf-5198ab627888"
+    # ckanr::resource_create(package_id = "2912fa34-a3b8-41a5-aedf-5198ab627888",
+    #                        name="kpmp_data_renal_new_targets",
+    #                        description="KPMP expression data for renal new targets",
+    #                        format="CSV", upload=fs::path(out_dir, "kpmp_expn_renal_new_targets", ext="csv"))
 
     plotfile <- fs::path(gene_annotation$metadata$out_dir,
                          stringr::str_replace_all(paste0(gene_annotation$metadata$setname,
@@ -591,7 +616,9 @@ annotate_gene_maf <- function(gene_annotation) {
                           "from open_targets_genetics.variant_index where gene_id_any in",
                           gene_annotation$metadata$gene_string)
 
-    res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
+    #res <- noctua::dbExecute(gene_annotation$metadata$con, query_string)
+    res <- mazer::athena_query(query_string, gene_annotation$metadata$con)
+
     maf_output <- noctua::dbFetch(res) %>%
         tibble::as_tibble() %>%
         dplyr::rename(gene_id = gene_id_any,

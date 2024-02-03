@@ -40,22 +40,22 @@ or "Variant Summaries" package within the Sightline CKAN organization.
 knitr::opts_chunk$set(eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE,
                       fig.width=12, fig.height=8)
 
-BiocManager::install(c("TissueEnrich",
-                       "AnnotationHub",
-                       "TxDb.Hsapiens.UCSC.hg38.knownGene",
-                       "org.Hs.eg.db",
-                       "rtracklayer",
-                       "trackViewer"))
-install.packages(c("janitor"))
-devtools::install_github(c("mazetx/VariantEngine",
-                           "mazetx/mazer"))
+# BiocManager::install(c("TissueEnrich",
+#                        "AnnotationHub",
+#                        "TxDb.Hsapiens.UCSC.hg38.knownGene",
+#                        "org.Hs.eg.db",
+#                        "rtracklayer",
+#                        "trackViewer"))
+# install.packages(c("janitor"))
+# devtools::install_github(c("mazetx/VariantEngine",
+#                            "mazetx/mazer"))
 
 library(rlang)
 library(tidyverse)
 library(janitor)
 library(ckanr)
 library(jsonlite)
-library(TissueEnrich) # bioc; look at Gordon Smyth's reimplemtation of GOseq
+#library(TissueEnrich) # bioc; look at Gordon Smyth's reimplemtation of GOseq
 library(kableExtra)
 library(flextable)
 library(edgeR)
@@ -73,7 +73,7 @@ data_dir <- "/data/AnnotationEngine"
 
 out_dir <- tempdir()
 
-con <- mazer::athena_connect(json = "auto")
+con <- mazer::athena_connect(catalog_name = "mazeCatalog", json = "auto")
 
 # suppress breaking error
 options(rstudio.connectionObserver.errorsSuppressed = TRUE)
@@ -84,6 +84,9 @@ ckan_key <- Sys.getenv("CKAN_KEY")
 ckanr::ckanr_setup(url = ckan_url, key = ckan_key)
 
 ah <- AnnotationHub()
+## The following each results in an 'Active external data pointer' that will
+## keep the session from being suspended. Either suspend session manually or
+## `rm` any of these objects that are loaded.
 edb_Hs <- ah[["AH109606"]]
 edb_Mm <- ah[["AH109655"]]
 txdb_Hs <- ah[["AH111585"]]
@@ -110,7 +113,8 @@ organization of CKAN. The organization includes packages for the Gene Catalog
 ```{r sightline-organization}
 # CKAN organizations
 
-sightline_org_id <- "acd65bfd-df6d-4297-ae33-ab837864b022"
+#sightline_org_id <- "acd65bfd-df6d-4297-ae33-ab837864b022"
+data_science_org_id <- 'c121e051-ef65-42d2-a491-62ee1c8a9e9d'
 sightline_catalog_pkg_id <- "6035361d-871c-4e24-a027-e044fe5d42a7"
 sightline_genes_catalog_res_id <- "7f7d302e-f5ab-49e2-812d-8d77473e9ab0"
 sightline_internal_variants_catalog_res_id <- "fbddef6d-b3b3-4386-933d-50be682648e6"
@@ -121,14 +125,6 @@ new_targets_org <- prepare_for_publication(ckan_org_id = new_targets_org_id,
                                     url = ckan_url,
                                     key = ckan_key,
                                     dry_run = TRUE)
-
-
-
-test_org_id <- "d4c31ff0-d146-456f-8114-f19e44bf8dbf"
-test_org <- prepare_for_publication(ckan_org_id = test_org_id,
-                                    url = ckan_url,
-                                    key = ckan_key,
-                                    dry_run = FALSE)
 ```
 
 
@@ -195,7 +191,7 @@ gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_or
 ```{r tissue-protein}
 ## 1b. Tissue specificity
 gene_annotation <- annotate_gene_tissue_hpa_specificity(gene_annotation_base)
-gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_org, prefix = "01b")
+#gene_annotation <- publish_annotation(gene_annotation, ckan_org = new_targets_org, prefix = "01b")
 ```
 
 ```{r kidney-cell-type-expression}
